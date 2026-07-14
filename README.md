@@ -74,6 +74,22 @@ Because replay only reveals data as it steps, hunting a break means stepping
 through the session — a hunt typically takes 15–45 s depending on how far the
 break is. Progress streams in the status line and a second click cancels.
 
+### P&L ledger (survives replay resets)
+
+TradingView wipes your Replay Trading results whenever the replay point moves
+backward — that reset happens server-side and can't be prevented. The panel's
+**P&L line** makes it not matter: it snapshots your replay executions and
+realized P&L every couple of seconds and **banks** the running session the
+instant a wipe (or replay exit) is detected.
+
+- `P&L live +120 | banked +860 (4)` → current session, plus totals across 4
+  wiped/ended sessions.
+- **csv** downloads every banked and live execution (time, side, qty, price,
+  per-session P&L) for your journal.
+- **clear** resets the banked ledger (your TradingView data is untouched).
+
+The ledger lives in your browser's localStorage, per TradingView chart domain.
+
 ## Notes & limitations
 
 - **Browser TradingView only** — the desktop app can't run userscripts.

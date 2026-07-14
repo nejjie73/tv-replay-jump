@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         TV Replay Jump
 // @namespace    tv-replay-jump
-// @version      1.1.0
-// @description  Jump TradingView bar replay to the next preset-time candle, or straight to the next break of a defined range (e.g. 18:00-18:15) — without resetting your replay session or trades.
+// @version      1.2.0
+// @description  Jump TradingView bar replay to the next preset-time candle or the next break of a defined range, plus a P&L ledger that survives replay resets — never lose your replay trading results again.
 // @match        https://www.tradingview.com/chart/*
 // @match        https://*.tradingview.com/chart/*
 // @grant        none
@@ -285,6 +285,69 @@
     setStatus('No tradable range found in 3 sessions', true);
   }
 
+  // ---------- Replay P&L ledger ----------
+  // TV wipes Replay Trading results whenever the replay point moves backward
+  // (the session resets server-side — unpreventable). This ledger snapshots
+  // executions/P&L every 2s and BANKS the last snapshot the moment a wipe or
+  // session end is detected, so results survive in localStorage + CSV.
+
+  function ledgerLoad() {
+    try { return JSON.parse(localStorage.getItem('tvj-ledger')) || { pl: 0, sessions: 0, entries: [] }; }
+    catch (e) { return { pl: 0, sessions: 0, entries: [] }; }
+  }
+  function ledgerSave(l) { try { localStorage.setItem('tvj-ledger', JSON.stringify(l)); } catch (e) {} }
+  function ledgerBank() {
+    const live = S.live;
+    if (!live || !live.ex.length) return;
+    const l = ledgerLoad();
+    l.pl += live.pl; l.sessions++;
+    l.entries.push({ at: Date.now(), sym: live.sym, pl: live.pl, ex: live.ex.slice(0, 200) });
+    if (l.entries.length > 100) l.entries = l.entries.slice(-100);
+    ledgerSave(l);
+    S.live = null;
+  }
+  function ledgerCsv() {
+    const l = ledgerLoad();
+    const rows = ['session,banked_at,symbol,exec_time_utc,side,qty,price,session_pl'];
+    const all = l.entries.concat(S.live && S.live.ex.length ? [{ at: null, sym: S.live.sym, pl: S.live.pl, ex: S.live.ex }] : []);
+    all.forEach((s, i) => {
+      const at = s.at ? new Date(s.at).toISOString() : 'live';
+      s.ex.forEach(e => rows.push([i + 1, at, s.sym, new Date(e.t * 1000).toISOString(), e.s > 0 ? 'buy' : 'sell', e.q, e.p, s.pl].join(',')));
+    });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([rows.join('\n')], { type: 'text/csv' }));
+    a.download = 'replay_ledger.csv';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  }
+  async function ledgerTick() {
+    try {
+      if (!S.ra) { const api = W.TradingViewApi; if (api) api.replayApi().then(ra => { S.ra = ra; }); return; }
+      const el = S.panel && S.panel.querySelector('#tvj-pl');
+      if (!el) return;
+      let ex = [], pl = 0, active = false;
+      if (uw(S.ra.isReplayStarted())) {
+        const tc = S.ra._replayUIController.tradingUIController();
+        const m = tc && tc.activeModel && tc.activeModel();
+        if (m) {
+          active = true;
+          ex = uw(m.executions()) || [];
+          const p = uw(m.realizedPL());
+          pl = typeof p === 'number' ? p : 0;
+        }
+      }
+      const live = S.live;
+      if (live && live.ex.length && (ex.length < live.ex.length || (ex.length && live.firstId && ex[0].id !== live.firstId)))
+        ledgerBank();                              // wipe/reset detected → bank the last snapshot
+      if (!active && live && live.ex.length) ledgerBank();   // replay ended → bank
+      if (ex.length) S.live = { ex: ex.map(e => ({ t: e.time_t, s: e.side, q: e.qty, p: e.price })), pl, firstId: ex[0].id, sym: ex[0].symbol };
+      const l = ledgerLoad();
+      const cur = S.live ? S.live.pl : 0;
+      el.textContent = 'P&L live ' + (cur >= 0 ? '+' : '') + cur.toFixed(0) + ' | banked ' + (l.pl >= 0 ? '+' : '') + l.pl.toFixed(0) + ' (' + l.sessions + ')';
+      el.style.color = (cur + l.pl) >= 0 ? '#4caf50' : '#f7525f';
+    } catch (e) {}
+  }
+
   // ---------- UI ----------
   function installPanel() {
     if (document.querySelector('#tvj-go')) return;
@@ -312,7 +375,11 @@
         '<input id="tvj-co" type="time" value="16:00" style="' + inpCss + ';flex:1">' +
         '<select id="tvj-mb" style="' + inpCss + '"><option>1</option><option selected>2</option><option>3</option></select>' +
         '<button id="tvj-break" style="' + btnCss + '">Break ▶</button></div>' +
-      '<div id="tvj-status" style="margin-top:7px;color:#787b86;min-height:14px"></div>';
+      '<div style="display:flex;gap:6px;align-items:center;margin-top:7px">' +
+        '<span id="tvj-pl" style="flex:1;color:#787b86">P&L —</span>' +
+        '<span id="tvj-csv" title="Download all banked + live replay trades as CSV" style="cursor:pointer;color:#2962ff">csv</span>' +
+        '<span id="tvj-clr" title="Clear the banked ledger (does not touch TV)" style="cursor:pointer;color:#787b86">clear</span></div>' +
+      '<div id="tvj-status" style="margin-top:5px;color:#787b86;min-height:14px"></div>';
     document.body.appendChild(panel);
 
     const $ = id => panel.querySelector('#' + id);
@@ -359,6 +426,11 @@
         endStr: $('tvj-re').value, cutoffStr: $('tvj-co').value
       }, setStatus);
     });
+
+    $('tvj-csv').onclick = ledgerCsv;
+    $('tvj-clr').onclick = () => { ledgerSave({ pl: 0, sessions: 0, entries: [] }); };
+    if (W.__tvjLedgerTimer) clearInterval(W.__tvjLedgerTimer);
+    W.__tvjLedgerTimer = setInterval(ledgerTick, 2000);
 
     $('tvj-x').onclick = () => { panel.remove(); S.dismissed = true; };
     const head = $('tvj-head');
