@@ -23,10 +23,22 @@ like the real tape).
 
 1. Install the [Tampermonkey](https://www.tampermonkey.net/) browser extension
    (Chrome / Edge / Firefox / Brave).
-2. Click **[Install TV Replay Jump](https://raw.githubusercontent.com/nejjie73/tv-replay-jump/main/TVReplayJump.user.js)**
+2. **Let Tampermonkey run userscripts** — Chrome and Edge block this by
+   default, and the script will silently do nothing until you allow it:
+   - Right-click the Tampermonkey icon → **Manage extension** → enable
+     **Allow user scripts** (Chrome 138+ / recent Edge), **or**
+   - open `chrome://extensions` (Edge: `edge://extensions`) and turn on
+     **Developer mode** (top-right in Chrome, left sidebar in Edge).
+   - Restart the browser after toggling. Firefox needs neither step.
+3. Click **[Install TV Replay Jump](https://raw.githubusercontent.com/nejjie73/tv-replay-jump/main/TVReplayJump.user.js)**
    — Tampermonkey will show an install screen; click **Install**.
-3. Open any [TradingView chart](https://www.tradingview.com/chart/). The panel
-   appears top-right (drag it by its header; ✕ hides it until the next reload).
+4. Open (or reload) any [TradingView chart](https://www.tradingview.com/chart/).
+   The panel appears top-right (drag it by its header; ✕ hides it until the
+   next reload).
+
+Not seeing the panel? It's almost always step 2 — verify by clicking the
+Tampermonkey icon while on the chart tab: it should list "TV Replay Jump"
+as active with a badge count of 1.
 
 Updates are automatic — Tampermonkey checks this repo and pulls new versions.
 
