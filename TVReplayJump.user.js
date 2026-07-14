@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         TV Replay Jump
 // @namespace    tv-replay-jump
-// @version      1.0.0
-// @description  Jump TradingView bar replay to the next preset-time candle (e.g. 18:15) without resetting your replay session or trades.
+// @version      1.1.0
+// @description  Jump TradingView bar replay to the next preset-time candle, or straight to the next break of a defined range (e.g. 18:00-18:15) — without resetting your replay session or trades.
 // @match        https://www.tradingview.com/chart/*
 // @match        https://*.tradingview.com/chart/*
 // @grant        none
@@ -14,19 +14,19 @@
 
 // Batch-steps TV's bar replay using the same internal operation as the
 // toolbar's step-forward button (so replay history/P&L is preserved), but
-// server-batched — a full day lands in a couple of calls. Landing is exact on
-// CME-style sessions (all gaps begin 17:00 ET). Uses TV's undocumented replay
-// API: may break after a TradingView update. Not affiliated with TradingView.
+// server-batched. v1.1 adds Range Break mode: define a range window and jump
+// straight to the next break of its high/low, with a per-day break cap and a
+// cutoff time. Uses TV's undocumented replay API: may break after a
+// TradingView update. Not affiliated with TradingView.
 (function () {
   'use strict';
-  // Page window: with @grant none most managers run us in page context, but
-  // fall back to unsafeWindow for sandboxed engines.
   const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 
   const GAP_START_ET = 17 * 60;
   const etFmt = new Intl.DateTimeFormat('en-GB', { timeZone: 'America/New_York', hour12: false, hour: '2-digit', minute: '2-digit' });
   const uw = v => (v && typeof v.value === 'function') ? v.value() : v;
   const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const S = { cancel: false, busy: false, panel: null, dismissed: false };
 
   function todMin(sec, fmt) {
     let h = 0, m = 0;
@@ -42,54 +42,74 @@
     return null;
   }
 
-  function chartFmt(tz) {
-    return new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour12: false, weekday: 'short', hour: '2-digit', minute: '2-digit' });
-  }
-
-  const S = { cancel: false, busy: false, panel: null };
-
-  async function jump(presetMin, setStatus) {
+  async function getCtx(setStatus) {
     const api = W.TradingViewApi;
     const ra = await api.replayApi();
-    if (!uw(ra.isReplayStarted())) { setStatus('Replay is not active', true); return; }
-
+    if (!uw(ra.isReplayStarted())) { setStatus('Replay is not active', true); return null; }
     const ch = api.activeChart();
     const barMin = resToMinutes(String(ch.resolution()));
-    if (barMin === null) { setStatus('Chart must be on a minute-based timeframe', true); return; }
-
+    if (barMin === null) { setStatus('Chart must be on a minute-based timeframe', true); return null; }
     let tz = 'America/New_York';
     try { tz = ch.getTimezoneApi().getTimezone().id || tz; } catch (e) {}
-    const tzF = new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour12: false, hour: '2-digit', minute: '2-digit' });
-    const showF = chartFmt(tz);
-    const mgr = ra._replayUIController._replayManager;
+    return {
+      ra, barMin, tz,
+      mgr: ra._replayUIController._replayManager,
+      tzF: new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour12: false, hour: '2-digit', minute: '2-digit' }),
+      showF: new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour12: false, weekday: 'short', hour: '2-digit', minute: '2-digit' }),
+      cur() { return uw(this.ra.currentDate()); },
+      fmt(sec) { return this.showF.format(new Date(sec * 1000)); }
+    };
+  }
 
-    let cur = uw(ra.currentDate());
-    if (typeof cur !== 'number') { setStatus('Cannot read replay position', true); return; }
+  // Step `chunk` bars, then wait out the position update: the step promise can
+  // resolve before currentDate moves, and during gap/weekend data loads
+  // currentDate streams stale values — require it to advance and hold still.
+  async function stepAndSettle(ctx, chunk, crossing) {
+    const cur = ctx.cur();
+    try { await ctx.mgr.doReplayStep(chunk); }
+    catch (e) { return null; }
+    let next = ctx.cur();
+    const t0 = Date.now();
+    while ((typeof next !== 'number' || next <= cur) && Date.now() - t0 < (crossing ? 45000 : 8000)) {
+      await sleep(300);
+      next = ctx.cur();
+    }
+    const stableMs = crossing ? 1500 : 350;
+    let lastChange = Date.now();
+    const tStable = Date.now();
+    while (Date.now() - lastChange < stableMs && Date.now() - tStable < 30000) {
+      await sleep(200);
+      const again = ctx.cur();
+      if (again !== next) { next = again; lastChange = Date.now(); }
+    }
+    return (typeof next === 'number' && next > cur) ? next : null;
+  }
 
-    // Absolute target: the next wall-clock preset occurrence. Once cur reaches
-    // it we stop — retargeting forward is only allowed when the occurrence had
-    // no bar (weekend/holiday) and the tape reopened BEFORE the preset
-    // time-of-day. Passing the target never rolls the jump to the next day.
-    let d0 = (presetMin - todMin(cur, tzF) + 1440) % 1440;
+  // Advance to the next wall-clock occurrence of presetMin (chart tz).
+  // Absolute-target: never rolls to the following day once the target is
+  // passed; forward retarget only when the occurrence had no bar (weekend)
+  // and the tape reopened before the preset time-of-day.
+  async function jumpToTod(ctx, presetMin, setStatus) {
+    let cur = ctx.cur();
+    if (typeof cur !== 'number') { setStatus('Cannot read replay position', true); return null; }
+
+    let d0 = (presetMin - todMin(cur, ctx.tzF) + 1440) % 1440;
     if (d0 === 0) d0 = 1440;
     let T = (Math.floor(cur / 60) + d0) * 60;
 
     for (let iter = 0; iter < 80; iter++) {
-      if (S.cancel) { setStatus('Cancelled at ' + showF.format(new Date(cur * 1000)), true); return; }
+      if (S.cancel) { setStatus('Cancelled at ' + ctx.fmt(cur), true); return null; }
 
-      const tod = todMin(cur, tzF);
+      const tod = todMin(cur, ctx.tzF);
       if (cur >= T) {
         const past = (tod - presetMin + 1440) % 1440;
-        if (past < barMin) {
-          setStatus('Landed: ' + showF.format(new Date(cur * 1000)), false, true);
-          return;
-        }
+        if (past < ctx.barMin) return cur;          // first bar at/after preset
         const ahead = (presetMin - tod + 1440) % 1440;
         if (ahead > 0 && ahead <= 720) {
-          T = (Math.floor(cur / 60) + ahead) * 60;
+          T = (Math.floor(cur / 60) + ahead) * 60;  // reopened before preset → same-session retarget
         } else {
-          setStatus('Landed: ' + showF.format(new Date(cur * 1000)) + ' (' + past + 'm past preset — gap/holiday)', false, true);
-          return;
+          setStatus('Landed: ' + ctx.fmt(cur) + ' (' + past + 'm past preset — gap/holiday)', false, true);
+          return cur;                               // overshoot: stop, never roll a day
         }
       }
 
@@ -99,76 +119,248 @@
       if (toGap === 0) toGap = 1440;
 
       const crossing = dist > toGap;
-      const chunk = Math.max(1, Math.ceil(Math.min(dist, toGap) / barMin));
-      setStatus('Stepping ' + chunk + ' bars from ' + showF.format(new Date(cur * 1000)) + '…');
-      try { await mgr.doReplayStep(chunk); }
-      catch (e) { setStatus('Step failed (end of data?) at ' + showF.format(new Date(cur * 1000)), true); return; }
-
-      // The step promise can resolve before the position updates, and during
-      // gap/weekend data loads currentDate streams stale values — wait for an
-      // advance, then require the value to hold still before trusting it.
-      let next = uw(ra.currentDate());
-      const t0 = Date.now();
-      while ((typeof next !== 'number' || next <= cur) && Date.now() - t0 < (crossing ? 20000 : 6000)) {
-        await sleep(300);
-        next = uw(ra.currentDate());
-      }
-      const stableMs = crossing ? 1500 : 350;
-      let lastChange = Date.now();
-      const tStable = Date.now();
-      while (Date.now() - lastChange < stableMs && Date.now() - tStable < 30000) {
-        await sleep(200);
-        const again = uw(ra.currentDate());
-        if (again !== next) { next = again; lastChange = Date.now(); }
-      }
-      if (typeof next !== 'number' || next <= cur) {
-        setStatus('Reached end of data at ' + showF.format(new Date(cur * 1000)), true);
-        return;
-      }
+      const chunk = Math.max(1, Math.ceil(Math.min(dist, toGap) / ctx.barMin));
+      setStatus('Stepping ' + chunk + ' bars from ' + ctx.fmt(cur) + '…');
+      const next = await stepAndSettle(ctx, chunk, crossing);
+      if (next === null) { setStatus('Reached end of data at ' + ctx.fmt(cur), true); return null; }
       cur = next;
     }
-    setStatus('Gave up after 80 batches at ' + showF.format(new Date(cur * 1000)), true);
+    setStatus('Gave up after 80 batches at ' + ctx.fmt(cur), true);
+    return null;
   }
 
+  async function jump(presetMin, setStatus, statusEl) {
+    const ctx = await getCtx(setStatus);
+    if (!ctx) return;
+    const landed = await jumpToTod(ctx, presetMin, setStatus);
+    if (landed !== null && !/past preset/.test(statusEl.textContent))
+      setStatus('Landed: ' + ctx.fmt(landed), false, true);
+  }
+
+  // ---------- Range Break mode ----------
+
+  function readBarsSince(epoch) {
+    const out = [];
+    try {
+      const cw = W.TradingViewApi.activeChart()._chartWidget;
+      cw.model().model().mainSeries().bars().each((i, v) => {
+        const b = Array.isArray(v) ? v : (v && v.value);
+        if (b && typeof b[0] === 'number' && b[0] >= epoch) out.push(b);
+        return false;
+      });
+    } catch (e) {}
+    return out;   // ascending [t, o, h, l, c, v]
+  }
+
+  // Break events over bars after the range window. A side re-arms only after
+  // price comes fully back inside the range. byClose: a break requires the
+  // bar to CLOSE beyond the range (a full bar-interval spent outside), not
+  // just a wick pierce; re-arm is then close-based too.
+  function scanBreaks(bars, H, L, byClose) {
+    let state = 'inside';
+    const ev = [];
+    for (const b of bars) {
+      const hi = byClose ? b[4] : b[2], lo = byClose ? b[4] : b[3];
+      if (state === 'inside') {
+        const up = hi > H, dn = lo < L;
+        if (up || dn) {
+          const dir = (up && dn) ? (b[4] >= b[1] ? 'up' : 'down') : (up ? 'up' : 'down');
+          ev.push({ t: b[0], dir });
+          state = dir === 'up' ? 'out_up' : 'out_down';
+        }
+      } else if (state === 'out_up') {
+        if (lo < L) { ev.push({ t: b[0], dir: 'down' }); state = 'out_down'; }
+        else if (hi <= H) state = 'inside';
+      } else {
+        if (hi > H) { ev.push({ t: b[0], dir: 'up' }); state = 'out_up'; }
+        else if (lo >= L) state = 'inside';
+      }
+    }
+    return ev;
+  }
+
+  async function rangeBreak(cfg, setStatus) {
+    const ctx = await getCtx(setStatus);
+    if (!ctx) return;
+    const spanMin = (cfg.endMin - cfg.startMin + 1440) % 1440;
+    if (spanMin === 0 || spanMin > 720) { setStatus('Range start must precede range end', true); return; }
+    if (ctx.barMin > spanMin) { setStatus('Chart timeframe is coarser than the range', true); return; }
+
+    for (let roll = 0; roll < 3; roll++) {
+      if (S.cancel) { setStatus('Cancelled', true); return; }
+      let cur = ctx.cur();
+      if (typeof cur !== 'number') { setStatus('Cannot read replay position', true); return; }
+
+      // Most recent range-end occurrence at/before cur; if we're before it
+      // (or its window has no bars — weekend/holiday), advance to the next.
+      const sinceEnd = (todMin(cur, ctx.tzF) - cfg.endMin + 1440) % 1440;
+      let wEnd = (Math.floor(cur / 60) - sinceEnd) * 60;
+      let wStart = wEnd - spanMin * 60;
+      let win = readBarsSince(wStart).filter(b => b[0] < wEnd);
+      const cutoff = wEnd + ((cfg.cutoffMin - cfg.endMin + 1440) % 1440) * 60;
+
+      const needNext = win.length === 0 || cur >= cutoff ||
+        scanBreaks(readBarsSince(wEnd).filter(b => b[0] < cutoff && b[0] <= cur),
+          Math.max(...win.map(b => b[2])), Math.min(...win.map(b => b[3])), cfg.byClose).length >= cfg.maxBreaks;
+
+      let cur0 = ctx.cur();                         // events at/before this are already consumed
+      if (needNext) {
+        setStatus('Advancing to next ' + cfg.endStr + ' range…');
+        const landed = await jumpToTod(ctx, cfg.endMin, setStatus);
+        if (landed === null) return;
+        cur = landed;
+        const s2 = (todMin(cur, ctx.tzF) - cfg.endMin + 1440) % 1440;
+        wEnd = (Math.floor(cur / 60) - s2) * 60;
+        wStart = wEnd - spanMin * 60;
+        // the series lags the replay position after a big jump — wait until
+        // the window is complete (both edges present) and its bar count holds
+        // still, or a partial load yields a bogus range
+        let lastCount = -1;
+        for (let w = 0; w < 30; w++) {
+          win = readBarsSince(wStart).filter(b => b[0] < wEnd);
+          const slack = 3 * ctx.barMin * 60;
+          const full = win.length > 0 &&
+            win[0][0] <= wStart + slack &&
+            win[win.length - 1][0] >= wEnd - slack;
+          if (full && win.length === lastCount) break;
+          lastCount = win.length;
+          await sleep(400);
+        }
+        if (win.length === 0) continue;            // dead session — roll again
+        cur0 = wEnd - 1;                            // fresh range: a break on its first bar counts
+      }
+
+      const H = Math.max(...win.map(b => b[2]));
+      const L = Math.min(...win.map(b => b[3]));
+      const cutoff2 = wEnd + ((cfg.cutoffMin - cfg.endMin + 1440) % 1440) * 60;
+      const rng = ' (rng ' + L + '–' + H + ')';
+
+      // Hunt: reveal bars and scan every one — detection is exact; batch size
+      // only affects how precisely we stop ON the break bar. Batches scale
+      // with distance-to-boundary in units of recent average bar range.
+      for (let iter = 0; iter < 600; iter++) {
+        if (S.cancel) { setStatus('Cancelled at ' + ctx.fmt(ctx.cur()), true); return; }
+        const bars = readBarsSince(wEnd).filter(b => b[0] < cutoff2);
+        const evs = scanBreaks(bars, H, L, cfg.byClose);
+        const hit = evs.find(e => e.t > cur0);
+        if (hit) {
+          const n = evs.filter(e => e.t <= hit.t).length;
+          const lateBars = bars.filter(b => b[0] > hit.t).length;
+          setStatus('Break ' + (hit.dir === 'up' ? '↑' : '↓') + ' #' + n + ' @ ' + ctx.fmt(hit.t) +
+            (lateBars ? ' (+' + lateBars + ' bars past)' : '') + rng, false, true);
+          return;
+        }
+        const last = bars[bars.length - 1];
+        const cur1 = ctx.cur();
+        if (cur1 >= cutoff2 || (last && last[0] + ctx.barMin * 60 >= cutoff2)) {
+          setStatus('No break before ' + cfg.cutoffStr + rng + ' — click again for next day', false, true);
+          return;
+        }
+        let chunk = 1;
+        if (last && bars.length >= 3) {
+          const tail = bars.slice(-14);
+          const atr = tail.reduce((s, b) => s + (b[2] - b[3]), 0) / tail.length || 0;
+          const c = last[4];
+          // distance to the nearest price that changes the state machine:
+          // inside → either boundary; outside → the far boundary (next break)
+          // or the near one (re-arm), whichever is closer
+          const dist = (c > H) ? Math.min(c - L, c - H) : (c < L) ? Math.min(H - c, L - c) : Math.min(H - c, c - L);
+          if (atr > 0 && dist > 2 * atr) chunk = Math.min(10, Math.floor(dist / atr));
+        }
+        if (last) chunk = Math.max(1, Math.min(chunk, Math.floor((cutoff2 - last[0]) / (ctx.barMin * 60))));
+        setStatus('Hunting break… ' + ctx.fmt(cur1) + rng);
+        const next = await stepAndSettle(ctx, chunk, false);
+        if (next === null) { setStatus('Reached end of data at ' + ctx.fmt(cur1), true); return; }
+        // the series lags the replay position briefly — let it catch up so the
+        // scan sees the bars we just revealed (else we overstep the break)
+        for (let w = 0; w < 10; w++) {
+          const nb = readBarsSince(wEnd);
+          if (nb.length && nb[nb.length - 1][0] >= next - ctx.barMin * 60 - 59) break;
+          await sleep(200);
+        }
+      }
+      setStatus('Gave up hunting (600 batches)', true);
+      return;
+    }
+    setStatus('No tradable range found in 3 sessions', true);
+  }
+
+  // ---------- UI ----------
   function installPanel() {
     if (document.querySelector('#tvj-go')) return;
+    const inpCss = 'background:#2a2e39;border:1px solid #434651;border-radius:4px;color:#d1d4dc;padding:3px 4px;font:inherit;color-scheme:dark';
+    const btnCss = 'background:#2962ff;border:none;border-radius:4px;color:#fff;padding:5px 12px;font:inherit;font-weight:600;cursor:pointer';
     const panel = document.createElement('div');
     S.panel = panel;
-    panel.style.cssText = 'position:fixed;top:64px;right:96px;z-index:2147483647;background:#1e222d;border:1px solid #434651;border-radius:8px;padding:8px 10px;font:12px -apple-system,"Trebuchet MS",Roboto,Ubuntu,sans-serif;color:#d1d4dc;box-shadow:0 2px 12px rgba(0,0,0,.45);user-select:none;min-width:196px';
+    panel.style.cssText = 'position:fixed;top:64px;right:96px;z-index:2147483647;background:#1e222d;border:1px solid #434651;border-radius:8px;padding:8px 10px;font:12px -apple-system,"Trebuchet MS",Roboto,Ubuntu,sans-serif;color:#d1d4dc;box-shadow:0 2px 12px rgba(0,0,0,.45);user-select:none;width:236px;box-sizing:border-box';
     panel.innerHTML =
       '<div id="tvj-head" style="display:flex;align-items:center;gap:6px;cursor:move;margin-bottom:7px">' +
         '<span style="font-weight:600;flex:1">Replay Jump</span>' +
         '<span id="tvj-x" style="cursor:pointer;color:#787b86;padding:0 3px">✕</span></div>' +
       '<div style="display:flex;gap:6px;align-items:center">' +
-        '<input id="tvj-time" type="time" value="18:15" style="background:#2a2e39;border:1px solid #434651;border-radius:4px;color:#d1d4dc;padding:4px 6px;font:inherit;color-scheme:dark">' +
-        '<button id="tvj-go" style="background:#2962ff;border:none;border-radius:4px;color:#fff;padding:5px 12px;font:inherit;font-weight:600;cursor:pointer">Jump ▶</button></div>' +
-      '<div id="tvj-status" style="margin-top:7px;color:#787b86;min-height:14px;max-width:230px"></div>';
+        '<input id="tvj-time" type="time" value="18:15" style="' + inpCss + ';flex:1">' +
+        '<button id="tvj-go" style="' + btnCss + '">Jump ▶</button></div>' +
+      '<div style="border-top:1px solid #2a2e39;margin:8px -10px 6px"></div>' +
+      '<div style="color:#787b86;font-weight:600;margin-bottom:5px">Range Break</div>' +
+      '<div style="display:flex;gap:4px;align-items:center;margin-bottom:5px">' +
+        '<input id="tvj-rs" type="time" value="18:00" style="' + inpCss + ';flex:1">' +
+        '<span style="color:#787b86">–</span>' +
+        '<input id="tvj-re" type="time" value="18:15" style="' + inpCss + ';flex:1">' +
+        '<select id="tvj-cf" title="Break trigger: touch = wick pierce (how a stop order fills), close = bar must close beyond the range" style="' + inpCss + '"><option selected>touch</option><option>close</option></select></div>' +
+      '<div style="display:flex;gap:4px;align-items:center">' +
+        '<span style="color:#787b86">cut</span>' +
+        '<input id="tvj-co" type="time" value="16:00" style="' + inpCss + ';flex:1">' +
+        '<select id="tvj-mb" style="' + inpCss + '"><option>1</option><option selected>2</option><option>3</option></select>' +
+        '<button id="tvj-break" style="' + btnCss + '">Break ▶</button></div>' +
+      '<div id="tvj-status" style="margin-top:7px;color:#787b86;min-height:14px"></div>';
     document.body.appendChild(panel);
 
     const $ = id => panel.querySelector('#' + id);
-    const statusEl = $('tvj-status'), goBtn = $('tvj-go'), timeIn = $('tvj-time');
-    try { timeIn.value = localStorage.getItem('tvj-preset') || '18:15'; } catch (e) {}
+    const statusEl = $('tvj-status'), goBtn = $('tvj-go'), breakBtn = $('tvj-break');
+    const fields = { 'tvj-time': '18:15', 'tvj-rs': '18:00', 'tvj-re': '18:15', 'tvj-co': '16:00', 'tvj-mb': '2', 'tvj-cf': 'touch' };
+    for (const id in fields) { try { $(id).value = localStorage.getItem(id) || fields[id]; } catch (e) {} }
+    const saveFields = () => { for (const id in fields) { try { localStorage.setItem(id, $(id).value); } catch (e) {} } };
 
     const setStatus = (msg, isErr, isDone) => {
       statusEl.textContent = msg;
       statusEl.style.color = isErr ? '#f7525f' : (isDone ? '#4caf50' : '#787b86');
     };
+    const toMin = v => { const p = v.split(':').map(Number); return isNaN(p[0]) ? null : p[0] * 60 + (p[1] || 0); };
 
-    goBtn.onclick = async () => {
+    async function runBusy(btn, fn) {
       if (S.busy) { S.cancel = true; return; }
-      const parts = timeIn.value.split(':').map(Number);
-      if (isNaN(parts[0])) { setStatus('Enter a time first', true); return; }
-      try { localStorage.setItem('tvj-preset', timeIn.value); } catch (e) {}
+      saveFields();
       S.busy = true; S.cancel = false;
-      goBtn.textContent = 'Cancel'; goBtn.style.background = '#f7525f';
-      try { await jump(parts[0] * 60 + parts[1], setStatus); }
+      const label = btn.textContent;
+      btn.textContent = 'Cancel'; btn.style.background = '#f7525f';
+      const other = btn === goBtn ? breakBtn : goBtn;
+      other.disabled = true; other.style.opacity = '0.5';
+      try { await fn(); }
       catch (e) { setStatus('Error: ' + (e && e.message || e), true); }
       S.busy = false; S.cancel = false;
-      goBtn.textContent = 'Jump ▶'; goBtn.style.background = '#2962ff';
-    };
-    timeIn.onkeydown = e => { if (e.key === 'Enter') goBtn.onclick(); };
-    $('tvj-x').onclick = () => { panel.remove(); S.dismissed = true; };
+      btn.textContent = label; btn.style.background = '#2962ff';
+      other.disabled = false; other.style.opacity = '';
+    }
 
+    goBtn.onclick = () => runBusy(goBtn, async () => {
+      const m = toMin($('tvj-time').value);
+      if (m === null) { setStatus('Enter a time first', true); return; }
+      await jump(m, setStatus, statusEl);
+    });
+    $('tvj-time').onkeydown = e => { if (e.key === 'Enter') goBtn.onclick(); };
+
+    breakBtn.onclick = () => runBusy(breakBtn, async () => {
+      const startMin = toMin($('tvj-rs').value), endMin = toMin($('tvj-re').value), cutoffMin = toMin($('tvj-co').value);
+      if (startMin === null || endMin === null || cutoffMin === null) { setStatus('Fill range and cutoff times', true); return; }
+      await rangeBreak({
+        startMin, endMin, cutoffMin,
+        maxBreaks: +$('tvj-mb').value || 2,
+        byClose: $('tvj-cf').value === 'close',
+        endStr: $('tvj-re').value, cutoffStr: $('tvj-co').value
+      }, setStatus);
+    });
+
+    $('tvj-x').onclick = () => { panel.remove(); S.dismissed = true; };
     const head = $('tvj-head');
     head.onmousedown = e => {
       if (e.target.id === 'tvj-x') return;

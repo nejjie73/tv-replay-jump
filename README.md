@@ -49,6 +49,31 @@ Updates are automatic — Tampermonkey checks this repo and pulls new versions.
 - Click again while it's running to cancel.
 - Clicking while already sitting on the preset candle advances to the next day.
 
+### Range Break mode
+
+For range-breakout testing: define a range window (say `18:00`–`18:15`) and hit
+**Break ▶** — replay advances to the range's completion, reads its high/low,
+then lands on the bar that **breaks** the range, so you never accidentally
+play past your entry.
+
+- **touch / close** — what counts as a break: `touch` = any wick pierce of the
+  range high/low (how a stop order at the edge would fill); `close` = the bar
+  must *close* beyond the range (a full bar-interval spent outside).
+- **cut** — cutoff time: breaks are only hunted between the range end and this
+  time (e.g. `16:00` next day).
+- **1/2/3** — max breaks per day. Each click jumps to the next break event; a
+  side re-arms after price trades fully back inside the range. Once the day's
+  breaks are used up (or the cutoff passes with no break), the next click
+  rolls to the next session's range automatically.
+- The status line reports each landing: direction, break number, time, and the
+  range values — plus `+n bars past` when the adaptive stepping lands a bar or
+  two beyond the break (detection itself is always exact; every revealed bar
+  is scanned).
+
+Because replay only reveals data as it steps, hunting a break means stepping
+through the session — a hunt typically takes 15–45 s depending on how far the
+break is. Progress streams in the status line and a second click cancels.
+
 ## Notes & limitations
 
 - **Browser TradingView only** — the desktop app can't run userscripts.
