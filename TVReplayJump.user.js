@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TV Replay Jump
 // @namespace    tv-replay-jump
-// @version      1.2.0
+// @version      1.2.1
 // @description  Jump TradingView bar replay to the next preset-time candle or the next break of a defined range, plus a P&L ledger that survives replay resets — never lose your replay trading results again.
 // @match        https://www.tradingview.com/chart/*
 // @match        https://*.tradingview.com/chart/*
@@ -240,9 +240,45 @@
       // with distance-to-boundary in units of recent average bar range.
       for (let iter = 0; iter < 600; iter++) {
         if (S.cancel) { setStatus('Cancelled at ' + ctx.fmt(ctx.cur()), true); return; }
-        const bars = readBarsSince(wEnd).filter(b => b[0] < cutoff2);
-        const evs = scanBreaks(bars, H, L, cfg.byClose);
-        const hit = evs.find(e => e.t > cur0);
+        // Never scan/step blind. Two series quirks: (1) the series lags the
+        // replay position, and (2) a newly revealed head bar sits as an
+        // o=h=l=c open-tick STUB, unchanged for ~1-1.2s, then its real OHLC
+        // lands in one burst — a break on it is invisible until then. So:
+        // wait for presence (position is next-bar-time − 1s, so the head
+        // opens one bar-interval before position+1), scan once — a break
+        // already visible is final (even a stub's open beyond the range
+        // can't un-break, except close-mode where the close can come back) —
+        // otherwise hold out the stub window anchored to when this head
+        // first appeared, confirm with stable reads, and rescan.
+        const posNow = ctx.cur();
+        let head = null;
+        for (let w = 0; w < 25; w++) {
+          const nb = readBarsSince(wEnd);
+          const h2 = nb[nb.length - 1];
+          if (h2 && h2[0] >= posNow + 1 - ctx.barMin * 60) { head = h2; break; }
+          await sleep(300);
+        }
+        let bars = readBarsSince(wEnd).filter(b => b[0] < cutoff2);
+        let evs = scanBreaks(bars, H, L, cfg.byClose);
+        let hit = evs.find(e => e.t > cur0);
+        const headFreshHit = hit && head && hit.t === head[0];
+        if ((!hit || (headFreshHit && cfg.byClose)) && head) {
+          if (S.headT !== head[0]) { S.headT = head[0]; S.headAt = Date.now(); }
+          const hold = S.headAt + 1900 - Date.now();
+          if (hold > 0) await sleep(hold);
+          let sig = null;
+          for (let w = 0; w < 8; w++) {
+            const nb = readBarsSince(wEnd);
+            const h2 = nb[nb.length - 1];
+            const s2 = h2 ? h2.join(',') : null;
+            if (s2 !== null && s2 === sig) break;
+            sig = s2;
+            await sleep(250);
+          }
+          bars = readBarsSince(wEnd).filter(b => b[0] < cutoff2);
+          evs = scanBreaks(bars, H, L, cfg.byClose);
+          hit = evs.find(e => e.t > cur0);
+        }
         if (hit) {
           const n = evs.filter(e => e.t <= hit.t).length;
           const lateBars = bars.filter(b => b[0] > hit.t).length;
@@ -271,13 +307,6 @@
         setStatus('Hunting break… ' + ctx.fmt(cur1) + rng);
         const next = await stepAndSettle(ctx, chunk, false);
         if (next === null) { setStatus('Reached end of data at ' + ctx.fmt(cur1), true); return; }
-        // the series lags the replay position briefly — let it catch up so the
-        // scan sees the bars we just revealed (else we overstep the break)
-        for (let w = 0; w < 10; w++) {
-          const nb = readBarsSince(wEnd);
-          if (nb.length && nb[nb.length - 1][0] >= next - ctx.barMin * 60 - 59) break;
-          await sleep(200);
-        }
       }
       setStatus('Gave up hunting (600 batches)', true);
       return;
@@ -351,7 +380,7 @@
   // ---------- UI ----------
   function installPanel() {
     if (document.querySelector('#tvj-go')) return;
-    const inpCss = 'background:#2a2e39;border:1px solid #434651;border-radius:4px;color:#d1d4dc;padding:3px 4px;font:inherit;color-scheme:dark';
+    const inpCss = 'background:#2a2e39;border:1px solid #434651;border-radius:4px;color:#d1d4dc;padding:3px 4px;font:inherit;color-scheme:dark;min-width:0';
     const btnCss = 'background:#2962ff;border:none;border-radius:4px;color:#fff;padding:5px 12px;font:inherit;font-weight:600;cursor:pointer';
     const panel = document.createElement('div');
     S.panel = panel;
@@ -367,14 +396,16 @@
       '<div style="color:#787b86;font-weight:600;margin-bottom:5px">Range Break</div>' +
       '<div style="display:flex;gap:4px;align-items:center;margin-bottom:5px">' +
         '<input id="tvj-rs" type="time" value="18:00" style="' + inpCss + ';flex:1">' +
-        '<span style="color:#787b86">–</span>' +
-        '<input id="tvj-re" type="time" value="18:15" style="' + inpCss + ';flex:1">' +
-        '<select id="tvj-cf" title="Break trigger: touch = wick pierce (how a stop order fills), close = bar must close beyond the range" style="' + inpCss + '"><option selected>touch</option><option>close</option></select></div>' +
-      '<div style="display:flex;gap:4px;align-items:center">' +
-        '<span style="color:#787b86">cut</span>' +
+        '<span style="color:#787b86;flex:none">–</span>' +
+        '<input id="tvj-re" type="time" value="18:15" style="' + inpCss + ';flex:1"></div>' +
+      '<div style="display:flex;gap:4px;align-items:center;margin-bottom:5px">' +
+        '<span style="color:#787b86;flex:none">cut</span>' +
         '<input id="tvj-co" type="time" value="16:00" style="' + inpCss + ';flex:1">' +
-        '<select id="tvj-mb" style="' + inpCss + '"><option>1</option><option selected>2</option><option>3</option></select>' +
-        '<button id="tvj-break" style="' + btnCss + '">Break ▶</button></div>' +
+        '<select id="tvj-cf" title="Break trigger: touch = wick pierce (how a stop order fills), close = bar must close beyond the range" style="' + inpCss + ';flex:none"><option selected>touch</option><option>close</option></select></div>' +
+      '<div style="display:flex;gap:4px;align-items:center">' +
+        '<span style="color:#787b86;flex:none">breaks/day</span>' +
+        '<select id="tvj-mb" style="' + inpCss + ';flex:none"><option>1</option><option selected>2</option><option>3</option></select>' +
+        '<button id="tvj-break" style="' + btnCss + ';flex:1;white-space:nowrap">Break ▶</button></div>' +
       '<div style="display:flex;gap:6px;align-items:center;margin-top:7px">' +
         '<span id="tvj-pl" style="flex:1;color:#787b86">P&L —</span>' +
         '<span id="tvj-csv" title="Download all banked + live replay trades as CSV" style="cursor:pointer;color:#2962ff">csv</span>' +
